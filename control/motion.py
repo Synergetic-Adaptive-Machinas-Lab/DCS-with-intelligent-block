@@ -278,7 +278,7 @@ class DynamicMoveToTargetTask:
         # Replanning config
         self.replan_interval = 1  # Check for map changes every N steps
         self.step_count = 0
-        self.voxel_update_interval_s = 8.0
+        self.voxel_update_interval_s = 5.0
         self.last_voxel_update_time = time.time()
         self._cube_shape_ids: tuple[int, int] | None = None
         self._cube_cfg = cfg["cube"]
@@ -321,6 +321,8 @@ class DynamicMoveToTargetTask:
         self.reached = False
         self.current_i = 0
         self.rob = robot
+        self.start_node = start_node
+        self.goal_node = goal_node
         self.robot_id = robot.robot_id if hasattr(robot, "robot_id") else int(robot)
         self.cruise_z = p.getBasePositionAndOrientation(self.robot_id)[0][2]
         self.step_count = 0
@@ -637,22 +639,40 @@ class DynamicMoveToTargetTask:
             return (ox, oy, oz)
         return None
 
+    def _node_free_voxel(self, node: SurfaceNode) -> tuple[int, int, int]:
+        return (
+            int(round(node.pos[0] - 0.5)),
+            int(round(node.pos[1] - 0.5)),
+            int(round(node.pos[2] - 0.5)),
+        )
+
     def _current_protected_voxels(self) -> set[tuple[int, int, int]]:
         protected: set[tuple[int, int, int]] = set()
-        if not self.path:
-            return protected
-        cur_state = self.path[min(self.current_i, len(self.path) - 1)]
-        next_state = (
-            self.path[self.current_i + 1]
-            if self.current_i + 1 < len(self.path)
-            else None
-        )
-        for state in (cur_state, next_state):
-            if state is None:
+        if self.path:
+            cur_state = self.path[min(self.current_i, len(self.path) - 1)]
+            next_state = (
+                self.path[self.current_i + 1]
+                if self.current_i + 1 < len(self.path)
+                else None
+            )
+            for state in (cur_state, next_state):
+                if state is None:
+                    continue
+                voxel = self._node_obstacle_voxel(state.node)
+                if voxel is not None:
+                    protected.add(voxel)
+                protected.add(self._node_free_voxel(state.node))
+        for node in (self.start_node, self.goal_node):
+            if node is None:
                 continue
-            voxel = self._node_obstacle_voxel(state.node)
-            if voxel is not None:
-                protected.add(voxel)
+            protected.add(self._node_free_voxel(node))
+        try:
+            current_pos = p.getBasePositionAndOrientation(self.robot_id)[0]
+            robot_node = self._find_closest_node(current_pos)
+            if robot_node is not None:
+                protected.add(self._node_free_voxel(robot_node))
+        except Exception:
+            pass
         return protected
 
     def _add_supported_voxels(self, count: int, protected: set[tuple[int, int, int]]) -> int:
