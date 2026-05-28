@@ -1,7 +1,5 @@
 from __future__ import annotations
 from typing import Any, Dict
-import random
-import time
 
 import numpy as np
 import pybullet as p
@@ -278,12 +276,6 @@ class DynamicMoveToTargetTask:
         # Replanning config
         self.replan_interval = 1  # Check for map changes every N steps
         self.step_count = 0
-        self.voxel_update_interval_s = 5.0
-        self.last_voxel_update_time = time.time()
-        self._cube_shape_ids: tuple[int, int] | None = None
-        self._cube_cfg = cfg["cube"]
-        self._stack_cfg = cfg["stack"]
-        self._use_maximal_coordinates = cfg["simulation"]["use_maximal_coordinates"]
         
     def detect_map_changes(self) -> Dict[tuple[int,int,int], int]:
         """
@@ -478,8 +470,6 @@ class DynamicMoveToTargetTask:
                     break
 
                 current_pos = p.getBasePositionAndOrientation(self.robot_id)[0]
-                self._maybe_update_dynamic_voxels()
-
                 # Periodically detect occupancy updates and trigger one batch replan.
                 self.step_count += 1
                 if self.step_count % self.replan_interval == 0:
@@ -621,132 +611,6 @@ class DynamicMoveToTargetTask:
 
         return
 
-    def _ensure_cube_shapes(self) -> None:
-        if self._cube_shape_ids is not None:
-            return
-        from factory import create_cube_shapes
-
-        self._cube_shape_ids = create_cube_shapes(self._cube_cfg)
-
-    def _node_obstacle_voxel(self, node: SurfaceNode) -> tuple[int, int, int] | None:
-        vx = int(round(node.pos[0] - 0.5))
-        vy = int(round(node.pos[1] - 0.5))
-        vz = int(round(node.pos[2] - 0.5))
-        ox = vx + NORM[node.face_dir][0]
-        oy = vy + NORM[node.face_dir][1]
-        oz = vz + NORM[node.face_dir][2]
-        if 0 <= ox < self.size_xyz[0] and 0 <= oy < self.size_xyz[1] and 0 <= oz < self.size_xyz[2]:
-            return (ox, oy, oz)
-        return None
-
-    def _node_free_voxel(self, node: SurfaceNode) -> tuple[int, int, int]:
-        return (
-            int(round(node.pos[0] - 0.5)),
-            int(round(node.pos[1] - 0.5)),
-            int(round(node.pos[2] - 0.5)),
-        )
-
-    def _current_protected_voxels(self) -> set[tuple[int, int, int]]:
-        protected: set[tuple[int, int, int]] = set()
-        if self.path:
-            cur_state = self.path[min(self.current_i, len(self.path) - 1)]
-            next_state = (
-                self.path[self.current_i + 1]
-                if self.current_i + 1 < len(self.path)
-                else None
-            )
-            for state in (cur_state, next_state):
-                if state is None:
-                    continue
-                voxel = self._node_obstacle_voxel(state.node)
-                if voxel is not None:
-                    protected.add(voxel)
-                protected.add(self._node_free_voxel(state.node))
-        for node in (self.start_node, self.goal_node):
-            if node is None:
-                continue
-            protected.add(self._node_free_voxel(node))
-        try:
-            current_pos = p.getBasePositionAndOrientation(self.robot_id)[0]
-            robot_node = self._find_closest_node(current_pos)
-            if robot_node is not None:
-                protected.add(self._node_free_voxel(robot_node))
-        except Exception:
-            pass
-        return protected
-
-    def _add_supported_voxels(self, count: int, protected: set[tuple[int, int, int]]) -> int:
-        if not isinstance(self.cube_stacks, list):
-            return 0
-        self._ensure_cube_shapes()
-        from factory import create_cube
-
-        visual_shape_id, collision_shape_id = self._cube_shape_ids
-        candidates: list[tuple[int, int, int]] = []
-        for x in range(len(self.cube_stacks)):
-            for y in range(len(self.cube_stacks[x])):
-                stack = self.cube_stacks[x][y]
-                z = len(stack)
-                if z == 0 or z >= self.size_xyz[2]:
-                    continue
-                if (x, y, z) in protected:
-                    continue
-                if self.occ[x, y, z] == 0 and self.occ[x, y, z - 1] == 1:
-                    candidates.append((x, y, z))
-
-        random.shuffle(candidates)
-        added = 0
-        for x, y, z in candidates[:count]:
-            base_pos = [(x + 1) * 1.0, (y + 1) * 1.0, 0.1]
-            new_cube_id = create_cube(
-                visual_shape_id,
-                collision_shape_id,
-                self._cube_cfg,
-                [base_pos[0], base_pos[1], base_pos[2] + self._stack_cfg["z_spacing"] * z],
-                self._use_maximal_coordinates,
-            )
-            self.cube_stacks[x][y].append(new_cube_id)
-            self.cube_picked[new_cube_id] = False
-            self.occ[x, y, z] = 1
-            added += 1
-        return added
-
-    def _remove_top_voxels(self, count: int, protected: set[tuple[int, int, int]]) -> int:
-        if not isinstance(self.cube_stacks, list):
-            return 0
-        candidates: list[tuple[int, int, int]] = []
-        for x in range(len(self.cube_stacks)):
-            for y in range(len(self.cube_stacks[x])):
-                stack = self.cube_stacks[x][y]
-                if not stack:
-                    continue
-                z = len(stack) - 1
-                if (x, y, z) in protected:
-                    continue
-                if self.occ[x, y, z] == 1:
-                    candidates.append((x, y, z))
-
-        random.shuffle(candidates)
-        removed = 0
-        for x, y, z in candidates[:count]:
-            cube_id = self.cube_stacks[x][y].pop()
-            p.removeBody(cube_id)
-            self.cube_picked.pop(cube_id, None)
-            self.occ[x, y, z] = 0
-            removed += 1
-        return removed
-
-    def _maybe_update_dynamic_voxels(self) -> None:
-        now = time.time()
-        if now - self.last_voxel_update_time < self.voxel_update_interval_s:
-            return
-        self.last_voxel_update_time = now
-        protected = self._current_protected_voxels()
-        added = self._add_supported_voxels(2, protected)
-        removed = self._remove_top_voxels(2, protected)
-        if added or removed:
-            print(f"Dynamic voxel update: +{added}, -{removed}")
-    
     def _extract_path_from_planner(self) -> list[OrientedNode]:
         """
         Extract path from D* Lite planner using stateless method.
